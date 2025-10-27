@@ -1,0 +1,11 @@
+log_entry,log_level
+"17/06/10 15:20:41 INFO storage.MemoryStore: Block broadcast_179_piece0 stored as bytes in memory (estimated size 5.5 KB, free 1155.2 KB)",INFO
+17/06/08 12:16:16 INFO output.FileOutputCommitter: File Output Committer Algorithm version is 1,INFO
+17/06/09 17:53:11 INFO output.FileOutputCommitter: File Output Committer Algorithm version is 1,INFO
+"17/03/23 14:30:38 INFO BlockManagerInfo: Added broadcast_6_piece31 in memory on mesos-slave-08:42788 (size: 4.0 MB, free: 13.8 GB)",INFO
+17/06/08 10:02:40 INFO executor.Executor: Finished task 38.0 in stage 422.0 (TID 16918). 2076 bytes result sent to driver,INFO
+17/06/09 17:52:32 INFO executor.CoarseGrainedExecutorBackend: Got assigned task 105948,INFO
+"17/02/01 18:32:52 INFO python.PythonRunner: Times: total = 973, boot = -28148, init = 28169, finish = 952",INFO
+17/06/08 22:12:34 INFO storage.BlockManager: Found block rdd_32658_30 locally,INFO
+"17/06/09 20:34:27 INFO python.PythonRunner: Times: total = 40, boot = 11, init = 29, finish = 0",INFO
+17/06/08 11:33:04 INFO storage.BlockManager: Found block rdd_2_22 locally,INFO
