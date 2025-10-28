@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from pyspark.sql import SparkSession, functions as F
 
-# ---------- Helpers: FS detection + single-file writers (same idea as problem1) ----------
+# ---------- Helpers: FS detection + single-file writers ----------
 def is_remote_fs(path: str) -> bool:
     scheme = urlparse(path).scheme
     return scheme in ("hdfs", "s3", "s3a", "s3n", "gs", "abfs")
@@ -55,20 +55,40 @@ def write_single_csv(df, spark, final_csv_path: str):
     (df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_dir))
     hdfs_rename_single_part(spark, tmp_dir, final_csv_path, ".csv")
 
-# ---------- Parsing & Aggregation ----------
+# ---------- Hadoop glob expansion (fix for S3A wildcards) ----------
+def expand_paths_with_hadoop(spark, pattern: str):
+    """Return a Python list of concrete paths for a given pattern using Hadoop glob."""
+    sc = spark.sparkContext
+    jvm = sc._jvm
+    conf = sc._jsc.hadoopConfiguration()
+    Path = jvm.org.apache.hadoop.fs.Path
+    URI = jvm.java.net.URI
+
+    # If no wildcards, return the single path
+    if not any(ch in pattern for ch in "*?[]"):
+        return [pattern]
+
+    uri = URI(pattern)
+    fs = jvm.org.apache.hadoop.fs.FileSystem.get(uri, conf)
+    statuses = fs.globStatus(Path(pattern))
+    if statuses is None:
+        return []
+    return [st.getPath().toString() for st in statuses]
+
+# ---------- Spark ----------
 def make_spark(app_name: str, master: str | None):
     b = SparkSession.builder.appName(app_name)
     if master:
         b = b.master(master)
     return b.getOrCreate()
 
+# ---------- Parsing & Aggregation ----------
 def extract_timestamps(df):
     """
     Extract timestamp from common Spark/YARN log prefixes.
     Supports:
       - 'YY/MM/DD HH:MM:SS ...'  e.g., '17/03/29 10:04:41 ...'
       - 'YYYY-MM-DD[ T]HH:MM:SS ...'
-    Returns df with a 'ts' (TimestampType) column.
     """
     # Pattern A: 17/03/29 10:04:41
     yy = F.regexp_extract("value", r"(\d{2})/(\d{2})/(\d{2}) (\d{2}:\d{2}:\d{2})", 1)
@@ -77,7 +97,7 @@ def extract_timestamps(df):
     hhmmss = F.regexp_extract("value", r"(\d{2})/(\d{2})/(\d{2}) (\d{2}:\d{2}:\d{2})", 4)
     ts_a = F.when(yy != "", F.concat(F.lit("20"), yy, F.lit("-"), mm, F.lit("-"), dd, F.lit(" "), hhmmss))
 
-    # Pattern B: 2017-03-29 10:04:41  或 2017-03-29T10:04:41
+    # Pattern B: 2017-03-29 10:04:41  or 2017-03-29T10:04:41
     ts_b = F.regexp_extract("value", r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", 1)
     ts_b2 = F.regexp_extract("value", r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", 2)
     ts_b_full = F.when(ts_b != "", F.concat(ts_b, F.lit(" "), ts_b2))
@@ -86,13 +106,15 @@ def extract_timestamps(df):
     return df.withColumn("ts", F.to_timestamp(ts_str, "yyyy-MM-dd HH:mm:ss"))
 
 def build_timeline(spark, input_path_glob: str):
-    # Read all text files (recursively if needed)
-    input_glob = input_path_glob
-    raw = spark.read.text(input_glob).withColumn("path", F.input_file_name())
+    # Expand to concrete paths with Hadoop glob to avoid S3A wildcard issues
+    paths = expand_paths_with_hadoop(spark, input_path_glob if any(ch in input_path_glob for ch in "*?[]")
+                                     else os.path.join(input_path_glob.rstrip("/"), "application_*/*"))
+    if not paths:
+        raise RuntimeError(f"No files matched input: {input_path_glob}")
+    raw = spark.read.text(paths).withColumn("path", F.input_file_name())
     raw = extract_timestamps(raw).filter(F.col("ts").isNotNull())
 
     # From path, derive application_id & cluster_id & app_number
-    # path example .../application_1485248649253_0001/...
     app_id = F.regexp_extract("path", r"(application_\d+_\d+)", 1)
     cluster_id = F.regexp_extract(app_id, r"application_(\d+)_\d+", 1)
     app_seq = F.regexp_extract(app_id, r"application_\d+_(\d+)", 1)
@@ -104,10 +126,8 @@ def build_timeline(spark, input_path_glob: str):
         .withColumn("app_number", app_number)
         .groupBy("cluster_id", "application_id", "app_number")
         .agg(F.min("ts").alias("start_time"),
-             F.max("ts").alias("end_time"))
-    )
+             F.max("ts").alias("end_time")))
 
-    # Format as strings for CSV
     timeline_fmt = (timeline
         .select(
             "cluster_id",
@@ -116,12 +136,10 @@ def build_timeline(spark, input_path_glob: str):
             F.date_format("start_time", "yyyy-MM-dd HH:mm:ss").alias("start_time"),
             F.date_format("end_time", "yyyy-MM-dd HH:mm:ss").alias("end_time"),
         )
-        .orderBy("cluster_id", "app_number")
-    )
+        .orderBy("cluster_id", "app_number"))
     return timeline_fmt
 
 def build_cluster_summary(timeline_df):
-    # Convert back to timestamp to compute min/max by cluster
     tl = (timeline_df
           .withColumn("start_ts", F.to_timestamp("start_time", "yyyy-MM-dd HH:mm:ss"))
           .withColumn("end_ts", F.to_timestamp("end_time", "yyyy-MM-dd HH:mm:ss")))
@@ -132,8 +150,7 @@ def build_cluster_summary(timeline_df):
             F.date_format(F.min("start_ts"), "yyyy-MM-dd HH:mm:ss").alias("cluster_first_app"),
             F.date_format(F.max("end_ts"), "yyyy-MM-dd HH:mm:ss").alias("cluster_last_app"),
         )
-        .orderBy(F.col("num_applications").desc())
-    )
+        .orderBy(F.col("num_applications").desc()))
     return per_cluster
 
 def write_stats_txt(spark, summary_df, timeline_df, out_txt):
@@ -177,12 +194,10 @@ def make_plots_from_csvs(out_dir):
     plt.figure(figsize=(10, 6))
     if sns:
         ax = sns.barplot(data=cs, x="cluster_id", y="num_applications")
-    else:
-        ax = plt.bar(cs["cluster_id"].astype(str), cs["num_applications"])
-    if sns:
         for i, v in enumerate(cs["num_applications"].tolist()):
             plt.text(i, v, str(v), ha="center", va="bottom", fontsize=10)
     else:
+        ax = plt.bar(cs["cluster_id"].astype(str), cs["num_applications"])
         for i, v in enumerate(cs["num_applications"].tolist()):
             plt.text(i, v, str(v), ha="center", va="bottom", fontsize=10)
     plt.xlabel("Cluster ID")
@@ -193,11 +208,9 @@ def make_plots_from_csvs(out_dir):
     plt.close()
 
     # ---- Density plot: durations (largest cluster) ----
-    # pick cluster with max apps
     if len(cs) > 0:
         largest_cluster = cs.sort_values("num_applications", ascending=False)["cluster_id"].iloc[0]
         tl2 = tl[tl["cluster_id"] == largest_cluster].copy()
-        # compute duration (minutes)
         tl2["start_time"] = pd.to_datetime(tl2["start_time"])
         tl2["end_time"] = pd.to_datetime(tl2["end_time"])
         tl2["duration_min"] = (tl2["end_time"] - tl2["start_time"]).dt.total_seconds() / 60.0
@@ -220,7 +233,7 @@ def main():
                         help="Spark master URL (e.g., spark://<MASTER_PRIVATE_IP>:7077). Optional if --skip-spark.")
     parser.add_argument("--net-id", default="unknown", help="Your net id (for logging only).")
     parser.add_argument("--input", default="data/raw/*/*",
-                        help="Input glob for logs (default: data/raw/*/*).")
+                        help="Input glob for logs (default: data/raw/*/*). Can be S3A.")
     parser.add_argument("--output", default="data/output/",
                         help="Output directory (default: data/output/).")
     parser.add_argument("--skip-spark", action="store_true",
@@ -234,8 +247,6 @@ def main():
     out_stats = os.path.join(out_dir, "problem2_stats.txt")
 
     if args.skip_spark:
-        # Just re-make charts & stats from existing CSVs
-        # Build basic stats text if missing
         try:
             make_plots_from_csvs(out_dir)
         except Exception as e:
@@ -258,7 +269,7 @@ def main():
     write_stats_txt(spark, summary_df, timeline_df, out_stats)
 
     # 4) visualizations from CSVs
-    spark.catalog.clearCache()  # free mem before pandas read
+    spark.catalog.clearCache()
     make_plots_from_csvs(out_dir)
 
     print("Wrote:")
