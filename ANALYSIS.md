@@ -72,8 +72,3 @@ _All outputs referenced live under `data/output/`._
   - `1474351042505`: 1 app (2016-11-18 → 11-19)
   - `1440487435730`: 1 app (2015-09-01)
   - `1460011102909`: 1 app (2016-07-26)
-
-**Visuals**
-
-![Apps per Cluster](data/output/problem2_bar_chart.png)
-![Duration Distribution (log minutes)](data/output/problem2_density_plot.png)
